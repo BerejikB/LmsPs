@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "LM Studio MCP server for a persistent PowerShell session",
   "command": "bash",
-  "args": ["-lc", "K:/Repos/LmsPs/scripts/start_ps_mcp_stdio.sh"],
+  "args": ["-lc", "$LMSPS_START"],
   "env": {
     "LMSPS_PWSH": "/mnt/c/Program Files/PowerShell/7/pwsh.exe",
     "LMSPS_LOGDIR": "/mnt/k/LMstudio/LmsPs/logs",
