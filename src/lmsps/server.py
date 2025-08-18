@@ -1,222 +1,133 @@
-import os
-import sys
-import time
-import json
-import shlex
-import psutil  # noqa: F401 (reserved for future health checks)
-import threading
-import subprocess
-import asyncio
-from datetime import datetime
-from typing import Optional
+# src/lmsps/server.py
+import os, sys, subprocess
+from typing import Optional, Dict, List
+from mcp.server.fastmcp import FastMCP
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-
-# Config via environment variables (no hardcoded paths)
-DEF_TRIM = int(os.getenv("LMSPS_TRIM_CHARS", "500"))
-DEF_TIMEOUT = int(os.getenv("LMSPS_TIMEOUT_SEC", "30"))
-LOGDIR = os.getenv(
-    "LMSPS_LOGDIR",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "logs")),
-)
-PWSH = os.getenv("LMSPS_PWSH", "pwsh.exe")
-PWSH_FALLBACK = os.getenv("LMSPS_PWSH_FALLBACK", "powershell.exe")
-
+# ---- boot log (never prints to stdout) ----
+LOGDIR = os.environ.get("LMSPS_LOGDIR") or os.path.join(os.getcwd(), "logs")
 os.makedirs(LOGDIR, exist_ok=True)
-LOG_PATH = os.path.join(LOGDIR, "lmsps_server.log")
+BOOTLOG = os.path.join(LOGDIR, "lmsps_boot.log")
+def _log(msg: str) -> None:
+    with open(BOOTLOG, "a", encoding="utf-8") as f:
+        f.write(msg.rstrip() + "\n")
 
+# Operational state
+_STATE = {
+    "cwd": os.path.normpath(os.environ.get("LMSPS_CWD") or os.getcwd()),
+    "env": {},  # session-only env overlay
+}
 
-def log(event: str, data: Optional[dict] = None):
+def _effective_env() -> Dict[str, str]:
+    e = os.environ.copy()
+    e.update(_STATE["env"])
+    return e
+
+def _trim(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n] + f"\n...[trimmed {len(s)-n} chars]"
+
+# ------------------ Tools (plain functions; not decorated) ------------------
+
+def tool_ps_run(
+    command: str,
+    timeout_sec: Optional[int] = None,
+    trim_chars: Optional[int] = None,
+) -> str:
+    """Run a PowerShell command and return combined stdout+stderr (trimmed)."""
+    exe = os.environ.get(
+        "LMSPS_PWSH",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+    t = int(timeout_sec or os.environ.get("LMSPS_TIMEOUT_SEC", "30"))
+    n = int(trim_chars or os.environ.get("LMSPS_TRIM_CHARS", "500"))
+
+    args = [
+        exe, "-NoLogo", "-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+        "-Command", command
+    ]
+
+    _log(f"ps_run start t={t}s n={n} cwd={_STATE['cwd']} cmd={command[:120]!r}")
+
     try:
-        payload = {
-            "ts": datetime.utcnow().isoformat() + "Z",
-            "event": event,
-        }
-        if data is not None:
-            payload.update(data)
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        # Never crash on logging
-        pass
-
-
-class PersistentPS:
-    def __init__(self):
-        self.proc: Optional[subprocess.Popen] = None
-        self.lock = threading.Lock()
-
-    def start(self):
-        if self.proc and self.proc.poll() is None:
-            return
-        exe = PWSH
-        # If the configured exe fails, try fallback
-        try:
-            test = subprocess.run(
-                [exe, "-NoLogo", "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if test.returncode != 0:
-                raise RuntimeError(test.stderr or test.stdout)
-        except Exception:
-            exe = PWSH_FALLBACK
-
-        # Launch interactive, persistent PowerShell
-        self.proc = subprocess.Popen(
-            [exe, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "Write-Output 'LmsPs Online'"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+        cp = subprocess.run(
+            args,
+            cwd=_STATE["cwd"],
+            env=_effective_env(),
+            capture_output=True,
             text=True,
-            bufsize=1,
-            universal_newlines=True,
+            timeout=t,
         )
-        # Drain initial banner
-        time.sleep(0.2)
-        self._drain()
+        out = (cp.stdout or "") + (("\n" + cp.stderr) if cp.stderr else "")
+        if not out.strip():
+            out = "(ok)" if cp.returncode == 0 else f"(exit {cp.returncode})"
+        result = _trim(out, n)
+        _log(f"ps_run done rc={cp.returncode} bytes={len(out)}")
+        return result
 
-    def _drain(self, timeout: float = 0.05) -> str:
-        out = []
-        if self.proc and self.proc.stdout:
-            start = time.time()
-            while time.time() - start < timeout:
-                if self.proc.poll() is not None:
-                    break
-                line = self.proc.stdout.readline()
-                if not line:
-                    break
-                out.append(line)
-        return "".join(out)
+    except subprocess.TimeoutExpired as e:
+        partial = (e.stdout or "") + (("\n" + (e.stderr or "")) if e.stderr else "")
+        msg = f"timeout after {t}s"
+        if partial:
+            partial = partial.strip()
+            msg += "\npartial output:\n" + _trim(partial, n)
+        _log(f"ps_run timeout t={t}s")
+        return msg
 
-    def run(self, command: str, timeout: int = DEF_TIMEOUT) -> str:
-        with self.lock:
-            self.start()
-            assert self.proc and self.proc.stdin and self.proc.stdout
-            sentinel = f"__LMSPS_SENTINEL_{int(time.time()*1000)}__"
-            script = f"{command}\nWrite-Output '{sentinel}'\n"
-            try:
-                self.proc.stdin.write(script)
-                self.proc.stdin.flush()
-            except Exception as e:
-                # Attempt a restart once
-                log("ps.stdin_error", {"err": str(e)})
-                self.reset()
-                self.proc.stdin.write(script)
-                self.proc.stdin.flush()
+    except Exception as e:
+        _log(f"ps_run error: {type(e).__name__}: {e}")
+        return f"error: {type(e).__name__}: {e}"
 
-            # Read until sentinel or timeout
-            output_lines = []
-            end_time = time.time() + timeout
-            while time.time() < end_time:
-                line = self.proc.stdout.readline()
-                if not line:
-                    time.sleep(0.01)
-                    continue
-                if sentinel in line:
-                    break
-                output_lines.append(line)
-            else:
-                output_lines.append(f"\n[Timeout after {timeout}s]\n")
-            return "".join(output_lines)
+def tool_cwd() -> str:
+    return _STATE["cwd"]
 
-    def cd(self, path: str) -> str:
-        # Use PowerShell-native quoting to minimize injection
-        return self.run(f"Set-Location -Path \"{path}\"; Get-Location")
+def tool_cd(path: str) -> str:
+    new = path if os.path.isabs(path) else os.path.abspath(os.path.join(_STATE["cwd"], path))
+    if not os.path.isdir(new):
+        raise FileNotFoundError(new)
+    _STATE["cwd"] = os.path.normpath(new)
+    return _STATE["cwd"]
 
-    def cwd_cmd(self) -> str:
-        return self.run("Get-Location")
+def tool_env_get(key: Optional[str] = None):
+    e = _effective_env()
+    if key is not None:
+        return e.get(key, "")
+    return dict(_STATE["env"])  # overlay only
 
-    def reset(self) -> str:
-        with self.lock:
-            if self.proc and self.proc.poll() is None:
-                try:
-                    self.proc.terminate()
-                    self.proc.wait(timeout=3)
-                except Exception:
-                    try:
-                        self.proc.kill()
-                    except Exception:
-                        pass
-            self.proc = None
-        self.start()
-        return "Reset OK"
+def tool_env_set(key: str, value: str) -> str:
+    _STATE["env"][key] = value
+    return "ok"
 
+def tool_ping() -> str:
+    return "pong"
 
-ps_session = PersistentPS()
+# ------------------ App factory (avoids duplicate registration) ------------------
 
+def build_app() -> FastMCP:
+    app = FastMCP("lmsps")
 
-def trim(s: str, n: int = DEF_TRIM) -> str:
-    return s if len(s) <= n else s[:n]
+    # Register tools exactly once per FastMCP instance
+    app.tool(name="ps_run")(tool_ps_run)
+    app.tool(name="cwd")(tool_cwd)
+    app.tool(name="cd")(tool_cd)
+    app.tool(name="env_get")(tool_env_get)
+    app.tool(name="env_set")(tool_env_set)
+    app.tool(name="ping")(tool_ping)
 
-
-async def run_stdio_server():
-    server = Server("lmsps")
-
-    @server.tool()
-    def ps_run(command: str, timeout: Optional[int] = None) -> str:
-        """Run a PowerShell command in the persistent session."""
-        to = timeout or DEF_TIMEOUT
-        log("tool_call", {"tool": "ps.run", "command": command, "timeout": to})
-        full = ps_session.run(command, timeout=to)
-        log("tool_result", {"tool": "ps.run", "response": full})
-        return trim(full)
-
-    @server.tool()
-    def ps_cd(path: str) -> str:
-        """Change directory in the persistent session."""
-        log("tool_call", {"tool": "ps.cd", "path": path})
-        full = ps_session.cd(path)
-        log("tool_result", {"tool": "ps.cd", "response": full})
-        return trim(full)
-
-    @server.tool()
-    def ps_cwd() -> str:
-        """Get current directory of the persistent session."""
-        log("tool_call", {"tool": "ps.cwd"})
-        full = ps_session.cwd_cmd()
-        log("tool_result", {"tool": "ps.cwd", "response": full})
-        return trim(full)
-
-    @server.tool()
-    def ps_reset() -> str:
-        """Restart the PowerShell process and clear state."""
-        log("tool_call", {"tool": "ps.reset"})
-        full = ps_session.reset()
-        log("tool_result", {"tool": "ps.reset", "response": full})
-        return trim(full)
-
-    @server.tool()
-    def ps_env_get(name: str) -> str:
-        """Get environment variable value inside the session."""
-        log("tool_call", {"tool": "ps.env_get", "name": name})
-        full = ps_session.run(f"$env:{name}")
-        log("tool_result", {"tool": "ps.env_get", "response": full})
-        return trim(full)
-
-    @server.tool()
-    def ps_env_set(name: str, value: str) -> str:
-        """Set environment variable inside the session."""
-        log("tool_call", {"tool": "ps.env_set", "name": name})
-        # Escape single quotes for PowerShell single-quoted string
-        val = value.replace("'", "''")
-        full = ps_session.run(f"$env:{name} = '{val}' ; Write-Output 'OK'")
-        log("tool_result", {"tool": "ps.env_set", "response": full})
-        return trim(full)
-
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream)
-
-
-def main():
-    # For LM Studio we always run stdio
-    try:
-        asyncio.run(run_stdio_server())
-    except KeyboardInterrupt:
-        pass
-
+    return app
 
 if __name__ == "__main__":
-    main()
+    try:
+        import mcp as _mcp
+        mcp_ver = getattr(_mcp, "__version__", "unknown")
+    except Exception:
+        mcp_ver = "unknown"
+    _log(f"BOOT exe={sys.executable}")
+    _log(f"BOOT module_file={__file__}")
+    _log(f"BOOT mcp_version={mcp_ver}")
+    _log(f"BOOT LMSPS_CWD={os.environ.get('LMSPS_CWD')}")
+    _log(f"BOOT LMSPS_LOGDIR={os.environ.get('LMSPS_LOGDIR')}")
+
+    app = build_app()
+    _log("BOOT tools=['ps_run','cwd','cd','env_get','env_set','ping']")
+    # STDIO by default; will wait for a client. Ctrl+C here will show KeyboardInterrupt (expected).
+    app.run()

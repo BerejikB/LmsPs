@@ -1,7 +1,4 @@
-$path = "K:\Repos\LmsPs\scripts\start_ps_mcp_stdio.ps1"
-New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
-@'
-# start_ps_mcp_stdio.ps1 — Windows PowerShell launcher for LmsPs (stdio)
+﻿# start_ps_mcp_stdio.ps1 â€” Windows PowerShell launcher for LmsPs (stdio)
 # No stdout from wrapper. Creates venv, installs (-e), verifies import, starts server.
 
 $ErrorActionPreference = "Stop"
@@ -85,7 +82,3 @@ Set-Location $Repo
 Log "Starting: $PyExe -m lmsps.server --stdio"
 & $PyExe -m lmsps.server --stdio 2>> $global:LogFile
 exit $LASTEXITCODE
-'@ | Set-Content -Encoding UTF8 -Path $path -Force
-
-# verify we replaced the old one (should show Run-Native, not Out-File piping)
-(Get-Content $path -Head 25) -join "`n"
