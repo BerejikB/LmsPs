@@ -57,8 +57,10 @@ def tool_ps_run(
             text=True,
             timeout=t,
         )
-        out = (cp.stdout or "") + (("\n" + cp.stderr) if cp.stderr else "")
-        if not out.strip():
+        stdout = cp.stdout or ""
+        stderr = cp.stderr or ""
+        out = stdout + (("\n" + stderr) if stderr else "")
+        if not stdout and not stderr:
             out = "(ok)" if cp.returncode == 0 else f"(exit {cp.returncode})"
         result = _trim(out, n)
         _log(f"ps_run done rc={cp.returncode} bytes={len(out)}")
