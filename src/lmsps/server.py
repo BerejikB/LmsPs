@@ -1,6 +1,7 @@
 # src/lmsps/server.py
+import locale
 import os, sys, subprocess
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 from mcp.server.fastmcp import FastMCP
 
 # ---- boot log (never prints to stdout) ----
@@ -26,6 +27,34 @@ def _trim(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + f"\n...[trimmed {len(s)-n} chars]"
 
 # ------------------ Tools (plain functions; not decorated) ------------------
+
+def _decode_stream(data: bytes) -> str:
+    if not data:
+        return ""
+
+    candidates = [
+        "utf-16-le",
+        "utf-16-be",
+        "utf-8-sig",
+        "utf-8",
+    ]
+
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        candidates.append(preferred)
+
+    seen = set()
+    for enc in candidates:
+        if enc in seen:
+            continue
+        seen.add(enc)
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+
+    return data.decode("latin-1", errors="replace")
+
 
 def tool_ps_run(
     command: str,
@@ -54,7 +83,7 @@ def tool_ps_run(
             cwd=_STATE["cwd"],
             env=_effective_env(),
             capture_output=True,
-            text=True,
+            text=False,
             timeout=t,
         )
         stdout = cp.stdout or ""
@@ -67,11 +96,19 @@ def tool_ps_run(
         return result
 
     except subprocess.TimeoutExpired as e:
-        partial = (e.stdout or "") + (("\n" + (e.stderr or "")) if e.stderr else "")
+        stdout = _decode_stream(e.stdout or b"")
+        stderr = _decode_stream(e.stderr or b"")
+        parts = []
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            parts.append(stderr)
+        decoded = "\n".join(parts)
         msg = f"timeout after {t}s"
-        if partial:
-            partial = partial.strip()
-            msg += "\npartial output:\n" + _trim(partial, n)
+        if decoded:
+            decoded = decoded.strip()
+            if decoded:
+                msg += "\npartial output:\n" + _trim(decoded, n)
         _log(f"ps_run timeout t={t}s")
         return msg
 
