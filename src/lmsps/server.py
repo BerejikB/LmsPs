@@ -1,7 +1,7 @@
 # src/lmsps/server.py
 import locale
 import os, sys, subprocess
-from typing import Optional, Dict, Union
+from typing import Optional, Dict
 from mcp.server.fastmcp import FastMCP
 
 # ---- boot log (never prints to stdout) ----
@@ -28,42 +28,16 @@ def _trim(s: str, n: int) -> str:
 
 # ------------------ Tools (plain functions; not decorated) ------------------
 
-def _decode_stream(data: Optional[Union[bytes, bytearray, memoryview, str]]) -> str:
-    if data is None:
-        return ""
-
-    if isinstance(data, str):
-        return data
-
-    if isinstance(data, memoryview):
-        data = data.tobytes()
-    elif isinstance(data, bytearray):
-        data = bytes(data)
-
-    if not isinstance(data, (bytes, bytearray)):
-        # Fallback: best-effort conversion for other buffer types.
-        data = bytes(data)
-
+def _decode_stream(data: bytes) -> str:
     if not data:
         return ""
 
-    looks_utf16 = False
-    if len(data) >= 2:
-        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
-            looks_utf16 = True
-        else:
-            sample = data[:32]
-            nulls = sample[1::2].count(0) + sample[0::2].count(0)
-            looks_utf16 = nulls >= max(1, len(sample) // 4)
-
-    candidates = []
-    if looks_utf16:
-        candidates.extend(["utf-16-le", "utf-16-be"])
-
-    candidates.extend([
+    candidates = [
+        "utf-16-le",
+        "utf-16-be",
         "utf-8-sig",
         "utf-8",
-    ])
+    ]
 
     preferred = locale.getpreferredencoding(False)
     if preferred:
@@ -112,13 +86,9 @@ def tool_ps_run(
             text=False,
             timeout=t,
         )
-        stdout = _decode_stream(cp.stdout)
-        stderr = _decode_stream(cp.stderr)
-        if stderr:
-            joiner = "\n" if stdout else ""
-            out = stdout + joiner + stderr
-        else:
-            out = stdout
+        stdout = cp.stdout or ""
+        stderr = cp.stderr or ""
+        out = stdout + (("\n" + stderr) if stderr else "")
         if not stdout and not stderr:
             out = "(ok)" if cp.returncode == 0 else f"(exit {cp.returncode})"
         result = _trim(out, n)
@@ -126,8 +96,8 @@ def tool_ps_run(
         return result
 
     except subprocess.TimeoutExpired as e:
-        stdout = _decode_stream(e.stdout)
-        stderr = _decode_stream(e.stderr)
+        stdout = _decode_stream(e.stdout or b"")
+        stderr = _decode_stream(e.stderr or b"")
         parts = []
         if stdout:
             parts.append(stdout)

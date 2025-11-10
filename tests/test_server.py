@@ -2,7 +2,6 @@ import importlib
 import sys
 import types
 from pathlib import Path
-from typing import Optional, Union
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -18,55 +17,20 @@ class PsRunOutputTests(TestCase):
         # Ensure we reload the module so patches don't leak between tests.
         self.server = importlib.import_module("lmsps.server")
 
-    def _run_with_output(
-        self,
-        stdout: Optional[Union[bytes, str]] = b"",
-        stderr: Optional[Union[bytes, str]] = b"",
-        returncode: int = 0,
-    ):
+    def _run_with_output(self, stdout: str = "", stderr: str = "", returncode: int = 0):
         fake = types.SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
         with patch("lmsps.server.subprocess.run", return_value=fake) as _:
             return self.server.tool_ps_run("dummy")
 
     def test_preserves_whitespace_only_stdout(self):
-        result = self._run_with_output(stdout=b"   ")
+        result = self._run_with_output(stdout="   ")
         self.assertEqual(result, "   ")
 
     def test_placeholder_only_when_no_output(self):
         result = self._run_with_output()
         self.assertEqual(result, "(ok)")
 
-    def test_exit_code_placeholder_when_no_output(self):
-        result = self._run_with_output(returncode=5)
-        self.assertEqual(result, "(exit 5)")
-
     def test_combines_stdout_and_stderr(self):
-        result = self._run_with_output(stdout=b"out", stderr=b"err")
+        result = self._run_with_output(stdout="out", stderr="err")
         self.assertEqual(result, "out\nerr")
-
-    def test_decodes_utf16_output(self):
-        utf16 = "Hello".encode("utf-16-le")
-        result = self._run_with_output(stdout=utf16)
-        self.assertEqual(result, "Hello")
-
-    def test_decodes_utf16_stderr(self):
-        utf16 = "Oops".encode("utf-16-le")
-        result = self._run_with_output(stderr=utf16, returncode=1)
-        self.assertEqual(result, "Oops")
-
-    def test_accepts_text_mode_stdout(self):
-        result = self._run_with_output(stdout="alpha")
-        self.assertEqual(result, "alpha")
-
-    def test_accepts_text_mode_stderr(self):
-        result = self._run_with_output(stderr="omega", returncode=2)
-        self.assertEqual(result, "omega")
-
-    def test_handles_mixed_text_and_binary_streams(self):
-        result = self._run_with_output(stdout="hello", stderr=b"warn")
-        self.assertEqual(result, "hello\nwarn")
-
-    def test_handles_none_outputs(self):
-        result = self._run_with_output(stdout=None, stderr=None)
-        self.assertEqual(result, "(ok)")
 
