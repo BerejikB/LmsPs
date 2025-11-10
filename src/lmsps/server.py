@@ -1,6 +1,7 @@
 # src/lmsps/server.py
+import locale
 import os, sys, subprocess
-from typing import Optional, Dict, List
+from typing import Optional, Dict, Union
 from mcp.server.fastmcp import FastMCP
 
 # ---- boot log (never prints to stdout) ----
@@ -26,6 +27,60 @@ def _trim(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + f"\n...[trimmed {len(s)-n} chars]"
 
 # ------------------ Tools (plain functions; not decorated) ------------------
+
+def _decode_stream(data: Optional[Union[bytes, bytearray, memoryview, str]]) -> str:
+    if data is None:
+        return ""
+
+    if isinstance(data, str):
+        return data
+
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+    elif isinstance(data, bytearray):
+        data = bytes(data)
+
+    if not isinstance(data, (bytes, bytearray)):
+        # Fallback: best-effort conversion for other buffer types.
+        data = bytes(data)
+
+    if not data:
+        return ""
+
+    looks_utf16 = False
+    if len(data) >= 2:
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            looks_utf16 = True
+        else:
+            sample = data[:32]
+            nulls = sample[1::2].count(0) + sample[0::2].count(0)
+            looks_utf16 = nulls >= max(1, len(sample) // 4)
+
+    candidates = []
+    if looks_utf16:
+        candidates.extend(["utf-16-le", "utf-16-be"])
+
+    candidates.extend([
+        "utf-8-sig",
+        "utf-8",
+    ])
+
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        candidates.append(preferred)
+
+    seen = set()
+    for enc in candidates:
+        if enc in seen:
+            continue
+        seen.add(enc)
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+
+    return data.decode("latin-1", errors="replace")
+
 
 def tool_ps_run(
     command: str,
@@ -54,22 +109,36 @@ def tool_ps_run(
             cwd=_STATE["cwd"],
             env=_effective_env(),
             capture_output=True,
-            text=True,
+            text=False,
             timeout=t,
         )
-        out = (cp.stdout or "") + (("\n" + cp.stderr) if cp.stderr else "")
-        if not out.strip():
+        stdout = _decode_stream(cp.stdout)
+        stderr = _decode_stream(cp.stderr)
+        if stderr:
+            joiner = "\n" if stdout else ""
+            out = stdout + joiner + stderr
+        else:
+            out = stdout
+        if not stdout and not stderr:
             out = "(ok)" if cp.returncode == 0 else f"(exit {cp.returncode})"
         result = _trim(out, n)
         _log(f"ps_run done rc={cp.returncode} bytes={len(out)}")
         return result
 
     except subprocess.TimeoutExpired as e:
-        partial = (e.stdout or "") + (("\n" + (e.stderr or "")) if e.stderr else "")
+        stdout = _decode_stream(e.stdout)
+        stderr = _decode_stream(e.stderr)
+        parts = []
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            parts.append(stderr)
+        decoded = "\n".join(parts)
         msg = f"timeout after {t}s"
-        if partial:
-            partial = partial.strip()
-            msg += "\npartial output:\n" + _trim(partial, n)
+        if decoded:
+            decoded = decoded.strip()
+            if decoded:
+                msg += "\npartial output:\n" + _trim(decoded, n)
         _log(f"ps_run timeout t={t}s")
         return msg
 
