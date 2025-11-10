@@ -86,13 +86,9 @@ def tool_ps_run(
             text=False,
             timeout=t,
         )
-        stdout = _decode_stream(cp.stdout or b"")
-        stderr = _decode_stream(cp.stderr or b"")
-        if stderr:
-            joiner = "\n" if stdout else ""
-            out = stdout + joiner + stderr
-        else:
-            out = stdout
+        stdout = cp.stdout or ""
+        stderr = cp.stderr or ""
+        out = stdout + (("\n" + stderr) if stderr else "")
         if not stdout and not stderr:
             out = "(ok)" if cp.returncode == 0 else f"(exit {cp.returncode})"
         result = _trim(out, n)
