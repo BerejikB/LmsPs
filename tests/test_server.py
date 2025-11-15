@@ -42,6 +42,10 @@ class PsRunOutputTests(TestCase):
         result = self._run_with_output(stdout=b"ok", stderr=b"warn")
         self.assertEqual(result, "ok\nwarn")
 
+    def test_stderr_only_has_no_leading_newline(self):
+        result = self._run_with_output(stderr="warn")
+        self.assertEqual(result, "warn")
+
     def test_get_childitem_command_wires_through(self):
         command = 'Get-ChildItem -Path "C:/Temp" -Filter "*.txt"'
 

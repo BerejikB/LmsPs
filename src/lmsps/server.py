@@ -28,61 +28,46 @@ def _trim(s: str, n: int) -> str:
 
 # ------------------ Tools (plain functions; not decorated) ------------------
 
-def _decode_stream(data: bytes) -> str:
-    if not data:
+def _decode_stream(raw: bytes) -> str:
+    if not raw:
         return ""
 
-    candidates = []
-    # PowerShell 5.1 defaults to UTF-16LE with embedded NUL bytes; prefer that
-    # when we detect a BOM or any NUL characters so we decode without mojibake.
-    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff") or b"\x00" in data:
-        candidates.extend(["utf-16-le", "utf-16-be"])
+    # PowerShell 5.1 defaults to UTF-16LE without advertising it to subprocess.
+    # Prefer decoding as UTF-16 when we see either a BOM or embedded NUL bytes
+    # (common for UTF-16 output). Fall back to UTF-8 variants and finally the
+    # locale's preferred codec before replacing undecodable bytes.
+    encodings = []
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff") or b"\x00" in raw:
+        encodings.extend(["utf-16", "utf-16-le", "utf-16-be"])
 
-    candidates.extend(["utf-8-sig", "utf-8", "utf-16-le", "utf-16-be"])
+    encodings.extend(["utf-8-sig", "utf-8"])
 
     preferred = locale.getpreferredencoding(False)
     if preferred:
-        candidates.append(preferred)
-
-    def _roundtrip_matches(text: str, enc: str) -> bool:
-        try:
-            if enc == "utf-8-sig":
-                return text.encode("utf-8-sig") == data
-            encoded = text.encode(enc)
-        except Exception:
-            return False
-
-        if enc == "utf-16-le" and data.startswith(b"\xff\xfe"):
-            return b"\xff\xfe" + encoded == data or encoded == data
-        if enc == "utf-16-be" and data.startswith(b"\xfe\xff"):
-            return b"\xfe\xff" + encoded == data or encoded == data
-        return encoded == data
+        encodings.append(preferred)
 
     seen = set()
-    for enc in candidates:
+    for enc in encodings:
         if enc in seen:
             continue
         seen.add(enc)
         try:
-            text = data.decode(enc)
+            text = raw.decode(enc)
         except UnicodeDecodeError:
             continue
-        if text.startswith("\ufeff"):
-            text = text.lstrip("\ufeff")
-        if _roundtrip_matches(text, enc):
-            return text
+        return text.lstrip("\ufeff")
 
-    return data.decode("latin-1", errors="replace")
+    return raw.decode("utf-8", errors="replace")
 
 
 def _ensure_text(data) -> str:
     """Normalize subprocess output (bytes/str/None) into a text string."""
     if not data:
         return ""
-    if isinstance(data, bytes):
-        return _decode_stream(data)
     if isinstance(data, str):
         return data
+    if isinstance(data, (bytes, bytearray)):
+        return _decode_stream(bytes(data))
     # Fallback for unexpected objects (e.g., memoryview); mirrors str() but keeps control
     return str(data)
 
@@ -124,18 +109,30 @@ def tool_ps_run(
         # surfaced when stderr/stdout were combined directly.
         stdout = _ensure_text(stdout_raw)
         stderr = _ensure_text(stderr_raw)
-        out = stdout + (("\n" + stderr) if stderr else "")
-        if not stdout and not stderr:
+        parts = []
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            parts.append(stderr)
+        if parts:
+            out = "\n".join(parts)
+        else:
             out = "(ok)" if cp.returncode == 0 else f"(exit {cp.returncode})"
         result = _trim(out, n)
-        stdout_bytes = stdout_raw if isinstance(stdout_raw, (bytes, bytearray)) else stdout.encode("utf-8")
-        stderr_bytes = stderr_raw if isinstance(stderr_raw, (bytes, bytearray)) else stderr.encode("utf-8")
-        _log(f"ps_run done rc={cp.returncode} bytes={len(stdout_bytes) + len(stderr_bytes)}")
+        if isinstance(stdout_raw, (bytes, bytearray)):
+            stdout_bytes = len(stdout_raw)
+        else:
+            stdout_bytes = len(stdout.encode("utf-8", errors="replace"))
+        if isinstance(stderr_raw, (bytes, bytearray)):
+            stderr_bytes = len(stderr_raw)
+        else:
+            stderr_bytes = len(stderr.encode("utf-8", errors="replace"))
+        _log(f"ps_run done rc={cp.returncode} bytes={stdout_bytes + stderr_bytes}")
         return result
 
     except subprocess.TimeoutExpired as e:
-        stdout = _decode_stream(e.stdout or b"")
-        stderr = _decode_stream(e.stderr or b"")
+        stdout = _ensure_text(e.stdout)
+        stderr = _ensure_text(e.stderr)
         parts = []
         if stdout:
             parts.append(stdout)
