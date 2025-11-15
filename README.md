@@ -42,14 +42,17 @@ python -m lmsps.server
 - **Execution**
   - Uses Windows PowerShell 5.1 (`powershell.exe`) with `-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass` to avoid side effects. Override the path with `LMSPS_POWERSHELL_PATH` (or legacy `LMSPS_PWSH`).
   - The process runs with the server's current working directory and an environment overlay managed by `env_set`.
-- **Output handling**
-  - PowerShell 5.1 emits UTF‑16LE bytes; output is decoded with BOM/unicode aware fallbacks and concatenated as `stdout` followed by `stderr` separated by a newline.
-  - If there is no output, the tool returns `(ok)` for exit code 0, or `(exit <code>)` otherwise.
-  - Results longer than `trim_chars` are truncated with a summary suffix (the full data is logged on disk).
+- **Return payload**
+  - The tool now returns a JSON object with fields:
+    - `status`: `ok`, `powershell-error`, `timeout`, `invalid-command`, or `internal-error`.
+    - `exit_code`: integer PowerShell exit code (or `null` for tool-level failures).
+    - `stdout` / `stderr`: decoded (UTF‑16/UTF‑8 aware) output trimmed to `trim_chars`.
+    - `message`: optional human-readable context (e.g., timeout notice, validation failure).
+    - `timeout_seconds`: populated only for timeout responses so callers know the enforced limit.
 - **Validation & failure modes**
-  - Commands must be non-empty strings and shorter than `LMSPS_MAX_COMMAND_CHARS`; invalid input returns `error: invalid-command: …` without touching PowerShell.
-  - Timeouts return `timeout after <n>s` along with any partial decoded output that PowerShell produced.
-  - Spawn failures or unexpected exceptions return `error: <Type>: <message>`.
+  - Commands must be non-empty strings and shorter than `LMSPS_MAX_COMMAND_CHARS`; invalid input returns `status: invalid-command` without touching PowerShell.
+  - Timeouts return `status: timeout` with any partial decoded output that PowerShell produced.
+  - Spawn failures or unexpected exceptions return `status: internal-error` along with the exception type in `message`.
 
 ## LM Studio configuration example
 Add to your LM Studio settings JSON:

@@ -26,6 +26,29 @@ def _effective_env() -> Dict[str, str]:
 def _trim(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + f"\n...[trimmed {len(s)-n} chars]"
 
+
+def _result_payload(
+    *,
+    status: str,
+    exit_code: Optional[int],
+    stdout: str,
+    stderr: str,
+    trim_chars: int,
+    message: Optional[str] = None,
+    timeout_seconds: Optional[int] = None,
+) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "status": status,
+        "exit_code": exit_code,
+        "stdout": _trim(stdout, trim_chars),
+        "stderr": _trim(stderr, trim_chars),
+    }
+    if message is not None:
+        payload["message"] = message
+    if timeout_seconds is not None:
+        payload["timeout_seconds"] = timeout_seconds
+    return payload
+
 # ------------------ Tools (plain functions; not decorated) ------------------
 
 DEFAULT_POWERSHELL_PATH = r"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
@@ -176,18 +199,27 @@ def tool_ps_run(
     command: str,
     timeout_sec: Optional[int] = None,
     trim_chars: Optional[int] = None,
-) -> str:
-    """Run a PowerShell command and return combined stdout+stderr (trimmed)."""
+
+) -> Dict[str, object]:
+    """Run a PowerShell command and return structured stdout/stderr data."""
+
+    env_timeout, env_trim = _command_limits()
+    t = _coerce_positive_int(timeout_sec, env_timeout)
+    n = _coerce_positive_int(trim_chars, env_trim)
 
     error, command_str = _validate_command(command)
     if error:
         _log(f"ps_run invalid: {error}")
-        return error
+        return _result_payload(
+            status="invalid-command",
+            exit_code=None,
+            stdout="",
+            stderr="",
+            trim_chars=n,
+            message=error,
+        )
 
     exe = _resolve_powershell_path()
-    env_timeout, env_trim = _command_limits()
-    t = _coerce_positive_int(timeout_sec, env_timeout)
-    n = _coerce_positive_int(trim_chars, env_trim)
 
     args = _build_powershell_args(exe, command_str)
 
@@ -213,16 +245,6 @@ def tool_ps_run(
         # surfaced when stderr/stdout were combined directly.
         stdout = _ensure_text(stdout_raw)
         stderr = _ensure_text(stderr_raw)
-        parts = []
-        if stdout:
-            parts.append(stdout)
-        if stderr:
-            parts.append(stderr)
-        if parts:
-            out = "\n".join(parts)
-        else:
-            out = "(ok)" if cp.returncode == 0 else f"(exit {cp.returncode})"
-        result = _trim(out, n)
         if isinstance(stdout_raw, (bytes, bytearray)):
             stdout_bytes = len(stdout_raw)
         else:
@@ -231,29 +253,44 @@ def tool_ps_run(
             stderr_bytes = len(stderr_raw)
         else:
             stderr_bytes = len(stderr.encode("utf-8", errors="replace"))
+        status = "ok" if cp.returncode == 0 else "powershell-error"
+        message = None
+        if status != "ok":
+            message = f"PowerShell exited with code {cp.returncode}"
         _log(f"ps_run done rc={cp.returncode} bytes={stdout_bytes + stderr_bytes}")
-        return result
+        return _result_payload(
+            status=status,
+            exit_code=cp.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            trim_chars=n,
+            message=message,
+        )
 
     except subprocess.TimeoutExpired as e:
         stdout = _ensure_text(e.stdout)
         stderr = _ensure_text(e.stderr)
-        parts = []
-        if stdout:
-            parts.append(stdout)
-        if stderr:
-            parts.append(stderr)
-        decoded = "\n".join(parts)
-        msg = f"timeout after {t}s"
-        if decoded:
-            decoded = decoded.strip()
-            if decoded:
-                msg += "\npartial output:\n" + _trim(decoded, n)
         _log(f"ps_run timeout t={t}s")
-        return msg
+        return _result_payload(
+            status="timeout",
+            exit_code=None,
+            stdout=stdout,
+            stderr=stderr,
+            trim_chars=n,
+            message=f"timeout after {t}s",
+            timeout_seconds=t,
+        )
 
     except Exception as e:
         _log(f"ps_run error: {type(e).__name__}: {e}")
-        return f"error: {type(e).__name__}: {e}"
+        return _result_payload(
+            status="internal-error",
+            exit_code=None,
+            stdout="",
+            stderr="",
+            trim_chars=n,
+            message=f"{type(e).__name__}: {e}",
+        )
 
 def tool_cwd() -> str:
     return _STATE["cwd"]
