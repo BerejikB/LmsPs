@@ -1,7 +1,7 @@
 # src/lmsps/server.py
 import locale
 import os, sys, subprocess
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 from mcp.server.fastmcp import FastMCP
 
 # ---- boot log (never prints to stdout) ----
@@ -13,6 +13,9 @@ def _log(msg: str) -> None:
         f.write(msg.rstrip() + "\n")
 
 # Operational state
+# FastMCP services requests sequentially, so this in-memory state is process
+# local rather than thread-safe shared memory. The cwd/env overlay here mirrors
+# how LM Studio expects a single-session PowerShell instance to behave.
 _STATE = {
     "cwd": os.path.normpath(os.environ.get("LMSPS_CWD") or os.getcwd()),
     "env": {},  # session-only env overlay
@@ -26,56 +29,208 @@ def _effective_env() -> Dict[str, str]:
 def _trim(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + f"\n...[trimmed {len(s)-n} chars]"
 
+
+def _result_payload(
+    *,
+    status: str,
+    exit_code: Optional[int],
+    stdout: str,
+    stderr: str,
+    trim_chars: int,
+    message: Optional[str] = None,
+    timeout_seconds: Optional[int] = None,
+) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "status": status,
+        "exit_code": exit_code,
+        "stdout": _trim(stdout, trim_chars),
+        "stderr": _trim(stderr, trim_chars),
+    }
+    if message is not None:
+        payload["message"] = message
+    if timeout_seconds is not None:
+        payload["timeout_seconds"] = timeout_seconds
+    return payload
+
 # ------------------ Tools (plain functions; not decorated) ------------------
 
-def _decode_stream(data: bytes) -> str:
-    if not data:
+DEFAULT_POWERSHELL_PATH = r"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+
+
+def _get_env_int(name: str, default: int, *, minimum: Optional[int] = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
+def _coerce_positive_int(value, fallback: int) -> int:
+    if value is None:
+        return fallback
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    if candidate <= 0:
+        return fallback
+    return candidate
+
+
+def _decode_stream(raw: bytes) -> str:
+    if not raw:
         return ""
 
-    candidates = [
-        "utf-16-le",
-        "utf-16-be",
-        "utf-8-sig",
-        "utf-8",
-    ]
+    # PowerShell 5.1 defaults to UTF-16LE without advertising it to subprocess.
+    # Prefer decoding as UTF-16 when we see either a BOM or embedded NUL bytes
+    # (common for UTF-16 output). Fall back to UTF-8 variants and finally the
+    # locale's preferred codec before replacing undecodable bytes.
+    encodings = []
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff") or b"\x00" in raw:
+        encodings.extend(["utf-16", "utf-16-le", "utf-16-be"])
+
+    encodings.extend(["utf-8-sig", "utf-8"])
 
     preferred = locale.getpreferredencoding(False)
     if preferred:
-        candidates.append(preferred)
+        encodings.append(preferred)
 
     seen = set()
-    for enc in candidates:
+    for enc in encodings:
         if enc in seen:
             continue
         seen.add(enc)
         try:
-            return data.decode(enc)
+            text = raw.decode(enc)
         except UnicodeDecodeError:
             continue
+        return text.lstrip("\ufeff")
 
-    return data.decode("latin-1", errors="replace")
+    return raw.decode("utf-8", errors="replace")
+
+
+def _ensure_text(data) -> str:
+    """Normalize subprocess output (bytes/str/None) into a text string."""
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data, (bytes, bytearray)):
+        return _decode_stream(bytes(data))
+    # Fallback for unexpected objects (e.g., memoryview); mirrors str() but keeps control
+    return str(data)
+
+
+def _resolve_powershell_path() -> str:
+    """Return the Windows PowerShell 5.1 executable path.
+
+    We prefer `LMSPS_POWERSHELL_PATH` for clarity but continue to honour the
+    legacy `LMSPS_PWSH` knob for compatibility with existing deployments.
+    """
+
+    path = os.environ.get("LMSPS_POWERSHELL_PATH")
+    if path:
+        return path
+    legacy = os.environ.get("LMSPS_PWSH")
+    if legacy:
+        return legacy
+    return DEFAULT_POWERSHELL_PATH
+
+
+def _command_limits() -> Tuple[int, int]:
+    """Return (timeout_seconds, max_trim_chars) for ps_run.
+
+    Timeouts are bounded per invocation to avoid hanging requests.  The trim
+    limit ensures we do not return unbounded data to the caller while still
+    allowing larger buffers to be configured for debugging.
+    """
+
+    t = _get_env_int("LMSPS_TIMEOUT_SEC", 30, minimum=1)
+    n = _get_env_int("LMSPS_TRIM_CHARS", 500, minimum=1)
+    return t, n
+
+
+def _max_command_chars() -> int:
+    return _get_env_int("LMSPS_MAX_COMMAND_CHARS", 8192, minimum=1)
+
+
+def _validate_command(command) -> Tuple[Optional[str], Optional[str]]:
+    """Validate incoming commands, returning (error, command_str).
+
+    The MCP contract expects a single string PowerShell pipeline.  Reject empty
+    commands or wildly long payloads early so the server cannot be coerced into
+    chewing through unbounded input.  We keep the exact string (including
+    leading/trailing whitespace) to avoid surprising the caller when PowerShell
+    treats whitespace as significant.
+    """
+
+    if not isinstance(command, str):
+        return "error: invalid-command: command must be a string", None
+
+    if not command.strip():
+        return "error: invalid-command: command must not be empty", None
+
+    max_chars = _max_command_chars()
+    if len(command) > max_chars:
+        return (
+            f"error: invalid-command: command exceeds {max_chars} characters",
+            None,
+        )
+
+    return None, command
+
+
+def _build_powershell_args(exe: str, command: str) -> list:
+    return [
+        exe,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        command,
+    ]
 
 
 def tool_ps_run(
     command: str,
     timeout_sec: Optional[int] = None,
     trim_chars: Optional[int] = None,
-) -> str:
-    """Run a PowerShell command and return combined stdout+stderr (trimmed)."""
-    exe = os.environ.get(
-        "LMSPS_PWSH",
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+) -> Dict[str, object]:
+    """Run a PowerShell command and return structured stdout/stderr data."""
+
+    env_timeout, env_trim = _command_limits()
+    t = _coerce_positive_int(timeout_sec, env_timeout)
+    n = _coerce_positive_int(trim_chars, env_trim)
+
+    error, command_str = _validate_command(command)
+    if error:
+        _log(f"ps_run invalid: {error}")
+        return _result_payload(
+            status="invalid-command",
+            exit_code=None,
+            stdout="",
+            stderr="",
+            trim_chars=n,
+            message=error,
+        )
+
+    exe = _resolve_powershell_path()
+
+    args = _build_powershell_args(exe, command_str)
+
+    _log(
+        "ps_run start t={t}s n={n} cwd={cwd} cmd={cmd!r}".format(
+            t=t, n=n, cwd=_STATE["cwd"], cmd=command_str[:120]
+        )
     )
-    t = int(timeout_sec or os.environ.get("LMSPS_TIMEOUT_SEC", "30"))
-    n = int(trim_chars or os.environ.get("LMSPS_TRIM_CHARS", "500"))
-
-    args = [
-        exe, "-NoLogo", "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "Bypass",
-        "-Command", command
-    ]
-
-    _log(f"ps_run start t={t}s n={n} cwd={_STATE['cwd']} cmd={command[:120]!r}")
 
     try:
         cp = subprocess.run(
@@ -86,35 +241,59 @@ def tool_ps_run(
             text=False,
             timeout=t,
         )
-        stdout = cp.stdout or ""
-        stderr = cp.stderr or ""
-        out = stdout + (("\n" + stderr) if stderr else "")
-        if not stdout and not stderr:
-            out = "(ok)" if cp.returncode == 0 else f"(exit {cp.returncode})"
-        result = _trim(out, n)
-        _log(f"ps_run done rc={cp.returncode} bytes={len(out)}")
-        return result
+        stdout_raw = cp.stdout
+        stderr_raw = cp.stderr
+        # PowerShell 5.1 streams are bytes (typically UTF-16LE). Normalize before
+        # joining so we don't hit the "can't concat str to bytes" TypeError that
+        # surfaced when stderr/stdout were combined directly.
+        stdout = _ensure_text(stdout_raw)
+        stderr = _ensure_text(stderr_raw)
+        if isinstance(stdout_raw, (bytes, bytearray)):
+            stdout_bytes = len(stdout_raw)
+        else:
+            stdout_bytes = len(stdout.encode("utf-8", errors="replace"))
+        if isinstance(stderr_raw, (bytes, bytearray)):
+            stderr_bytes = len(stderr_raw)
+        else:
+            stderr_bytes = len(stderr.encode("utf-8", errors="replace"))
+        status = "ok" if cp.returncode == 0 else "powershell-error"
+        message = None
+        if status != "ok":
+            message = f"PowerShell exited with code {cp.returncode}"
+        _log(f"ps_run done rc={cp.returncode} bytes={stdout_bytes + stderr_bytes}")
+        return _result_payload(
+            status=status,
+            exit_code=cp.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            trim_chars=n,
+            message=message,
+        )
 
     except subprocess.TimeoutExpired as e:
-        stdout = _decode_stream(e.stdout or b"")
-        stderr = _decode_stream(e.stderr or b"")
-        parts = []
-        if stdout:
-            parts.append(stdout)
-        if stderr:
-            parts.append(stderr)
-        decoded = "\n".join(parts)
-        msg = f"timeout after {t}s"
-        if decoded:
-            decoded = decoded.strip()
-            if decoded:
-                msg += "\npartial output:\n" + _trim(decoded, n)
+        stdout = _ensure_text(e.stdout)
+        stderr = _ensure_text(e.stderr)
         _log(f"ps_run timeout t={t}s")
-        return msg
+        return _result_payload(
+            status="timeout",
+            exit_code=None,
+            stdout=stdout,
+            stderr=stderr,
+            trim_chars=n,
+            message=f"timeout after {t}s",
+            timeout_seconds=t,
+        )
 
     except Exception as e:
         _log(f"ps_run error: {type(e).__name__}: {e}")
-        return f"error: {type(e).__name__}: {e}"
+        return _result_payload(
+            status="internal-error",
+            exit_code=None,
+            stdout="",
+            stderr="",
+            trim_chars=n,
+            message=f"{type(e).__name__}: {e}",
+        )
 
 def tool_cwd() -> str:
     return _STATE["cwd"]
