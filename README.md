@@ -27,10 +27,12 @@ python -m lmsps.server
 ```
 
 ## Environment variables
-- `LMSPS_PWSH` — PowerShell executable (default `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`)
+- `LMSPS_POWERSHELL_PATH` — Preferred path to Windows PowerShell 5.1 (default `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`).
+- `LMSPS_PWSH` — Legacy override for the PowerShell executable (retained for backward compatibility).
 - `LMSPS_LOGDIR` — log directory (default: `<repo>/logs`)
 - `LMSPS_TRIM_CHARS` — max characters returned to client (default: `500`)
 - `LMSPS_TIMEOUT_SEC` — per‑call timeout in seconds (default: `30`)
+- `LMSPS_MAX_COMMAND_CHARS` — maximum PowerShell command length accepted by `ps_run` (default: `8192`)
 
 ## `ps_run` tool
 - **Arguments**
@@ -38,13 +40,14 @@ python -m lmsps.server
   - `timeout_sec` (optional): overrides the per-call timeout (defaults to `LMSPS_TIMEOUT_SEC` or 30s).
   - `trim_chars` (optional): overrides the maximum characters returned to the client (defaults to `LMSPS_TRIM_CHARS` or 500).
 - **Execution**
-  - Uses Windows PowerShell 5.1 (`powershell.exe`) by default to maximize LM Studio compatibility. Override `LMSPS_PWSH` if you need `pwsh.exe` or a custom path.
+  - Uses Windows PowerShell 5.1 (`powershell.exe`) with `-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass` to avoid side effects. Override the path with `LMSPS_POWERSHELL_PATH` (or legacy `LMSPS_PWSH`).
   - The process runs with the server's current working directory and an environment overlay managed by `env_set`.
 - **Output handling**
   - PowerShell 5.1 emits UTF‑16LE bytes; output is decoded with BOM/unicode aware fallbacks and concatenated as `stdout` followed by `stderr` separated by a newline.
   - If there is no output, the tool returns `(ok)` for exit code 0, or `(exit <code>)` otherwise.
   - Results longer than `trim_chars` are truncated with a summary suffix (the full data is logged on disk).
-- **Failure modes**
+- **Validation & failure modes**
+  - Commands must be non-empty strings and shorter than `LMSPS_MAX_COMMAND_CHARS`; invalid input returns `error: invalid-command: …` without touching PowerShell.
   - Timeouts return `timeout after <n>s` along with any partial decoded output that PowerShell produced.
   - Spawn failures or unexpected exceptions return `error: <Type>: <message>`.
 

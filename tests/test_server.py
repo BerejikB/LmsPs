@@ -1,4 +1,5 @@
 import importlib
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -52,6 +53,10 @@ class PsRunOutputTests(TestCase):
         def fake_run(args, **kwargs):
             # args[-1] is the PowerShell command string passed via -Command
             self.assertEqual(args[-1], command)
+            self.assertEqual(
+                args[0],
+                self.server.DEFAULT_POWERSHELL_PATH,
+            )
             return types.SimpleNamespace(stdout=b"item1\r\n", stderr=b"", returncode=0)
 
         with patch("lmsps.server.subprocess.run", side_effect=fake_run):
@@ -72,4 +77,47 @@ class PsRunOutputTests(TestCase):
         big = "X" * 120
         result = self._run_with_output(stdout=big, trim_chars=50)
         self.assertTrue(result.endswith("...[trimmed 70 chars]"))
+
+    def test_command_must_be_string(self):
+        result = self.server.tool_ps_run(123)  # type: ignore[arg-type]
+        self.assertIn("invalid-command", result)
+
+    def test_command_must_not_be_empty(self):
+        result = self.server.tool_ps_run("   ")
+        self.assertIn("invalid-command", result)
+
+    def test_command_length_is_limited(self):
+        too_long = "x" * 9000
+        with patch.dict("os.environ", {"LMSPS_MAX_COMMAND_CHARS": "100"}):
+            result = self.server.tool_ps_run(too_long)
+        self.assertEqual(
+            result,
+            "error: invalid-command: command exceeds 100 characters",
+        )
+
+    def test_custom_powershell_path_used(self):
+        sentinel = r"D:\\PwSh\\powershell.exe"
+
+        def fake_run(args, **kwargs):
+            self.assertEqual(args[0], sentinel)
+            return types.SimpleNamespace(stdout=b"ok", stderr=b"", returncode=0)
+
+        with patch.dict("os.environ", {"LMSPS_POWERSHELL_PATH": sentinel}):
+            with patch("lmsps.server.subprocess.run", side_effect=fake_run):
+                result = self.server.tool_ps_run("Write-Output ok")
+        self.assertEqual(result, "ok")
+
+    def test_timeout_reports_partial_output(self):
+        exc = subprocess.TimeoutExpired(cmd="powershell", timeout=1)
+        exc.stdout = b"partial"
+        exc.stderr = b""
+
+        with patch(
+            "lmsps.server.subprocess.run",
+            side_effect=exc,
+        ):
+            result = self.server.tool_ps_run("Start-Sleep 5", timeout_sec=1)
+
+        self.assertIn("timeout after", result)
+        self.assertIn("partial", result)
 

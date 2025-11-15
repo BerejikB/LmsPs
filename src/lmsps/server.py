@@ -1,7 +1,7 @@
 # src/lmsps/server.py
 import locale
 import os, sys, subprocess
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 from mcp.server.fastmcp import FastMCP
 
 # ---- boot log (never prints to stdout) ----
@@ -27,6 +27,34 @@ def _trim(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + f"\n...[trimmed {len(s)-n} chars]"
 
 # ------------------ Tools (plain functions; not decorated) ------------------
+
+DEFAULT_POWERSHELL_PATH = r"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+
+
+def _get_env_int(name: str, default: int, *, minimum: Optional[int] = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
+def _coerce_positive_int(value, fallback: int) -> int:
+    if value is None:
+        return fallback
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    if candidate <= 0:
+        return fallback
+    return candidate
+
 
 def _decode_stream(raw: bytes) -> str:
     if not raw:
@@ -72,26 +100,102 @@ def _ensure_text(data) -> str:
     return str(data)
 
 
+def _resolve_powershell_path() -> str:
+    """Return the Windows PowerShell 5.1 executable path.
+
+    We prefer `LMSPS_POWERSHELL_PATH` for clarity but continue to honour the
+    legacy `LMSPS_PWSH` knob for compatibility with existing deployments.
+    """
+
+    path = os.environ.get("LMSPS_POWERSHELL_PATH")
+    if path:
+        return path
+    legacy = os.environ.get("LMSPS_PWSH")
+    if legacy:
+        return legacy
+    return DEFAULT_POWERSHELL_PATH
+
+
+def _command_limits() -> Tuple[int, int]:
+    """Return (timeout_seconds, max_trim_chars) for ps_run.
+
+    Timeouts are bounded per invocation to avoid hanging requests.  The trim
+    limit ensures we do not return unbounded data to the caller while still
+    allowing larger buffers to be configured for debugging.
+    """
+
+    t = _get_env_int("LMSPS_TIMEOUT_SEC", 30, minimum=1)
+    n = _get_env_int("LMSPS_TRIM_CHARS", 500, minimum=1)
+    return t, n
+
+
+def _max_command_chars() -> int:
+    return _get_env_int("LMSPS_MAX_COMMAND_CHARS", 8192, minimum=1)
+
+
+def _validate_command(command) -> Tuple[Optional[str], Optional[str]]:
+    """Validate incoming commands, returning (error, command_str).
+
+    The MCP contract expects a single string PowerShell pipeline.  Reject empty
+    commands or wildly long payloads early so the server cannot be coerced into
+    chewing through unbounded input.  We keep the exact string (including
+    leading/trailing whitespace) to avoid surprising the caller when PowerShell
+    treats whitespace as significant.
+    """
+
+    if not isinstance(command, str):
+        return "error: invalid-command: command must be a string", None
+
+    if not command.strip():
+        return "error: invalid-command: command must not be empty", None
+
+    max_chars = _max_command_chars()
+    if len(command) > max_chars:
+        return (
+            f"error: invalid-command: command exceeds {max_chars} characters",
+            None,
+        )
+
+    return None, command
+
+
+def _build_powershell_args(exe: str, command: str) -> list:
+    return [
+        exe,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        command,
+    ]
+
+
 def tool_ps_run(
     command: str,
     timeout_sec: Optional[int] = None,
     trim_chars: Optional[int] = None,
 ) -> str:
     """Run a PowerShell command and return combined stdout+stderr (trimmed)."""
-    exe = os.environ.get(
-        "LMSPS_PWSH",
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+    error, command_str = _validate_command(command)
+    if error:
+        _log(f"ps_run invalid: {error}")
+        return error
+
+    exe = _resolve_powershell_path()
+    env_timeout, env_trim = _command_limits()
+    t = _coerce_positive_int(timeout_sec, env_timeout)
+    n = _coerce_positive_int(trim_chars, env_trim)
+
+    args = _build_powershell_args(exe, command_str)
+
+    _log(
+        "ps_run start t={t}s n={n} cwd={cwd} cmd={cmd!r}".format(
+            t=t, n=n, cwd=_STATE["cwd"], cmd=command_str[:120]
+        )
     )
-    t = int(timeout_sec or os.environ.get("LMSPS_TIMEOUT_SEC", "30"))
-    n = int(trim_chars or os.environ.get("LMSPS_TRIM_CHARS", "500"))
-
-    args = [
-        exe, "-NoLogo", "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "Bypass",
-        "-Command", command
-    ]
-
-    _log(f"ps_run start t={t}s n={n} cwd={_STATE['cwd']} cmd={command[:120]!r}")
 
     try:
         cp = subprocess.run(
