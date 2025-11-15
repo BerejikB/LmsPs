@@ -32,16 +32,31 @@ def _decode_stream(data: bytes) -> str:
     if not data:
         return ""
 
-    candidates = [
-        "utf-16-le",
-        "utf-16-be",
-        "utf-8-sig",
-        "utf-8",
-    ]
+    candidates = []
+    # PowerShell 5.1 defaults to UTF-16LE with embedded NUL bytes; prefer that
+    # when we detect a BOM or any NUL characters so we decode without mojibake.
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff") or b"\x00" in data:
+        candidates.extend(["utf-16-le", "utf-16-be"])
+
+    candidates.extend(["utf-8-sig", "utf-8", "utf-16-le", "utf-16-be"])
 
     preferred = locale.getpreferredencoding(False)
     if preferred:
         candidates.append(preferred)
+
+    def _roundtrip_matches(text: str, enc: str) -> bool:
+        try:
+            if enc == "utf-8-sig":
+                return text.encode("utf-8-sig") == data
+            encoded = text.encode(enc)
+        except Exception:
+            return False
+
+        if enc == "utf-16-le" and data.startswith(b"\xff\xfe"):
+            return b"\xff\xfe" + encoded == data or encoded == data
+        if enc == "utf-16-be" and data.startswith(b"\xfe\xff"):
+            return b"\xfe\xff" + encoded == data or encoded == data
+        return encoded == data
 
     seen = set()
     for enc in candidates:
@@ -49,11 +64,27 @@ def _decode_stream(data: bytes) -> str:
             continue
         seen.add(enc)
         try:
-            return data.decode(enc)
+            text = data.decode(enc)
         except UnicodeDecodeError:
             continue
+        if text.startswith("\ufeff"):
+            text = text.lstrip("\ufeff")
+        if _roundtrip_matches(text, enc):
+            return text
 
     return data.decode("latin-1", errors="replace")
+
+
+def _ensure_text(data) -> str:
+    """Normalize subprocess output (bytes/str/None) into a text string."""
+    if not data:
+        return ""
+    if isinstance(data, bytes):
+        return _decode_stream(data)
+    if isinstance(data, str):
+        return data
+    # Fallback for unexpected objects (e.g., memoryview); mirrors str() but keeps control
+    return str(data)
 
 
 def tool_ps_run(
@@ -86,13 +117,20 @@ def tool_ps_run(
             text=False,
             timeout=t,
         )
-        stdout = cp.stdout or ""
-        stderr = cp.stderr or ""
+        stdout_raw = cp.stdout
+        stderr_raw = cp.stderr
+        # PowerShell 5.1 streams are bytes (typically UTF-16LE). Normalize before
+        # joining so we don't hit the "can't concat str to bytes" TypeError that
+        # surfaced when stderr/stdout were combined directly.
+        stdout = _ensure_text(stdout_raw)
+        stderr = _ensure_text(stderr_raw)
         out = stdout + (("\n" + stderr) if stderr else "")
         if not stdout and not stderr:
             out = "(ok)" if cp.returncode == 0 else f"(exit {cp.returncode})"
         result = _trim(out, n)
-        _log(f"ps_run done rc={cp.returncode} bytes={len(out)}")
+        stdout_bytes = stdout_raw if isinstance(stdout_raw, (bytes, bytearray)) else stdout.encode("utf-8")
+        stderr_bytes = stderr_raw if isinstance(stderr_raw, (bytes, bytearray)) else stderr.encode("utf-8")
+        _log(f"ps_run done rc={cp.returncode} bytes={len(stdout_bytes) + len(stderr_bytes)}")
         return result
 
     except subprocess.TimeoutExpired as e:
