@@ -13,6 +13,9 @@ def _log(msg: str) -> None:
         f.write(msg.rstrip() + "\n")
 
 # Operational state
+# FastMCP services requests sequentially, so this in-memory state is process
+# local rather than thread-safe shared memory. The cwd/env overlay here mirrors
+# how LM Studio expects a single-session PowerShell instance to behave.
 _STATE = {
     "cwd": os.path.normpath(os.environ.get("LMSPS_CWD") or os.getcwd()),
     "env": {},  # session-only env overlay

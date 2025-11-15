@@ -42,6 +42,7 @@ python -m lmsps.server
 - **Execution**
   - Uses Windows PowerShell 5.1 (`powershell.exe`) with `-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass` to avoid side effects. Override the path with `LMSPS_POWERSHELL_PATH` (or legacy `LMSPS_PWSH`).
   - The process runs with the server's current working directory and an environment overlay managed by `env_set`.
+  - The working directory persists across calls; use `cd` to reposition before running relative-path commands.
 - **Return payload**
   - The tool now returns a JSON object with fields:
     - `status`: `ok`, `powershell-error`, `timeout`, `invalid-command`, or `internal-error`.
@@ -78,6 +79,12 @@ Add to your LM Studio settings JSON:
 - `cd` → change to a test directory and re‑run `cwd`
 - `env_set`/`env_get` → write/read a temp environment variable
 - Re‑run `ps_run` to confirm session persistence
+
+## Working directory model
+- The MCP server maintains a single-process working directory stored in memory.
+- `cwd` reports the current directory, and `cd` updates it (accepting absolute or relative paths).
+- Subsequent `ps_run` commands execute within that directory, so `Get-ChildItem -Path .` and `Get-Content` on relative paths resolve as expected.
+- FastMCP routes requests sequentially, so there is no concurrent mutation of this state; the model matches LM Studio's expectation of a single PowerShell session.
 
 ## Logs
 - Full request/response JSON lines are appended to `LMSPS_LOGDIR`/`lmsps_server.log`.

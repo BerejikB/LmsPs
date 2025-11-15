@@ -1,8 +1,10 @@
 import importlib
+import os
 import subprocess
 import sys
 import types
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -16,7 +18,8 @@ if str(SRC_DIR) not in sys.path:
 class PsRunOutputTests(TestCase):
     def setUp(self):
         # Ensure we reload the module so patches don't leak between tests.
-        self.server = importlib.import_module("lmsps.server")
+        module = importlib.import_module("lmsps.server")
+        self.server = importlib.reload(module)
 
     def _run_with_output(self, stdout="", stderr="", returncode: int = 0, **kwargs):
         fake = types.SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
@@ -153,4 +156,44 @@ class PsRunOutputTests(TestCase):
         self.assertIn("RuntimeError", result["message"])
         self.assertEqual(result["stdout"], "")
         self.assertEqual(result["stderr"], "")
+
+    def test_cd_updates_cwd_and_supports_relative_paths(self):
+        original = self.server.tool_cwd()
+        self.addCleanup(lambda: self.server.tool_cd(original))
+
+        with TemporaryDirectory() as tmp:
+            normalized_tmp = os.path.normpath(tmp)
+            cwd_after_cd = self.server.tool_cd(normalized_tmp)
+            self.assertEqual(cwd_after_cd, normalized_tmp)
+            self.assertEqual(self.server.tool_cwd(), normalized_tmp)
+
+            child = Path(tmp) / "child"
+            child.mkdir()
+            child_result = self.server.tool_cd("child")
+            expected_child = os.path.normpath(child)
+            self.assertEqual(child_result, expected_child)
+            self.assertEqual(self.server.tool_cwd(), expected_child)
+
+    def test_ps_run_uses_current_working_directory(self):
+        original = self.server.tool_cwd()
+        self.addCleanup(lambda: self.server.tool_cd(original))
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "nest"
+            target.mkdir()
+            self.server.tool_cd(str(target))
+
+            captured = {}
+
+            def fake_run(args, **kwargs):
+                captured["cwd"] = kwargs.get("cwd")
+                self.assertEqual(args[-1], "Get-ChildItem -Path .")
+                return types.SimpleNamespace(stdout=b"", stderr=b"", returncode=0)
+
+            with patch("lmsps.server.subprocess.run", side_effect=fake_run):
+                result = self.server.tool_ps_run("Get-ChildItem -Path .")
+
+        self.assertEqual(result["status"], "ok")
+        expected_cwd = os.path.normpath(target)
+        self.assertEqual(captured["cwd"], expected_cwd)
 
